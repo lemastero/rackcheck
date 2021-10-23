@@ -1,29 +1,19 @@
 #lang racket/base
 
 (require racket/contract
-         racket/function
-         racket/match
-         racket/promise
          racket/random
-         racket/stream)
+         racket/stream
+         (submod "shrink-tree.rkt" private))
 
 (provide
  exn:fail:gen?
  exn:fail:gen:exhausted?
 
  gen?
- make-gen
- shrink-tree?
- build-shrink-tree
- make-shrink-tree
- shrink-tree-map
- value
- shrink
  generator/c
+ make-gen
  sample
- ;sample-shrink
- ;eager-shrink
- full-shrink
+ shrink
 
  gen:const
  gen:map
@@ -39,114 +29,47 @@
 (struct exn:fail:gen exn:fail ())
 (struct exn:fail:gen:exhausted exn:fail:gen ())
 
-(struct shrink-tree (val shrinks))
-
-(define/contract (value st)
-  (-> shrink-tree? any/c)
-  (shrink-tree-val st))
-
-(define/contract (shrink st)
-  (-> shrink-tree? (stream/c shrink-tree?))
-  (shrink-tree-shrinks st))
-
-(define/contract (build-shrink-tree val shr)
-  (-> any/c (-> any/c (stream/c any/c)) shrink-tree?)
-  (shrink-tree
-   val
-   (stream-map (lambda (v) (build-shrink-tree v shr))
-               (shr val))))
-
-(define/contract (make-shrink-tree val [shrinks empty-stream])
-  (->* (any/c) ((stream/c any/c)) shrink-tree?)
-  (shrink-tree val shrinks))
-
-(define/contract (shrink-tree-map f st)
-  (-> (-> any/c any/c) shrink-tree? shrink-tree?)
-  (shrink-tree
-   (f (value st))
-   (stream-map (curry shrink-tree-map f)
-               (shrink st))))
-
-(define (shrink-tree-join st)
-  (match-let ([(shrink-tree (shrink-tree inner-val inner-shrinks) outer-shrinks) st])
-    (shrink-tree
-     inner-val
-     (stream-append (stream-map shrink-tree-join outer-shrinks)
-                    inner-shrinks))))
-
 (define generator/c
   (-> pseudo-random-generator? exact-nonnegative-integer? shrink-tree?))
 
-(struct gen (f)
-  #:property prop:procedure (struct-field-index f))
+(struct gen (proc)
+  #:property prop:procedure (struct-field-index proc))
 
-(define/contract (make-gen f)
+(define/contract (make-gen proc)
   (-> generator/c gen?)
-  (gen f))
+  (gen proc))
 
 (define/contract (sample g [n 10] [rng (current-pseudo-random-generator)])
   (->* (gen?) (exact-positive-integer? pseudo-random-generator?) (listof any/c))
   (for/list ([s (in-range n)])
     (shrink-tree-val (g rng (expt s 2)))))
 
-; it would be pretty neat to have a visual program for exploring shrink trees
-#;(define/contract (sample-shrink g [size 30] #:samples [n 4] #:max-depth [depth 8] [rng (current-pseudo-random-generator)])
-  (->* (gen?) (exact-positive-integer?
-               #:samples exact-positive-integer?
-               #:max-depth exact-positive-integer?
-               pseudo-random-generator?)
-       (values any/c (listof (listof any/c))))
-  (let ([st (g rng size)])
-    (values
-     (shrink-tree-val st)
-     (let* ([shrinks (stream->list (shrink st))]
-            [starts (random-sample shrinks (min n (length shrinks)) rng #:replacement? #f)])
-       (for/list ([st starts])
-         (let loop ([st st]
-                    [depth depth])
-           (if (zero? depth)
-               '(...)
-               (match-let ([(shrink-tree val shrinks) st])
-                 (let ([shrinks (stream->list shrinks)])
-                   (if (null? shrinks)
-                       (list val)
-                       (cons val (loop (random-ref shrinks rng) (sub1 depth)))))))))))))
-
-#;(define/contract (eager-shrink g [size 30] [rng (current-pseudo-random-generator)])
-  (->* (gen?) (exact-positive-integer? pseudo-random-generator?)
-       (values any/c (listof any/c)))
-  (let ([st (g rng size)])
-    (values
-     (shrink-tree-val st)
-     (let loop ([st st])
-       (let ([shrinks (shrink st)])
-         (if (null? shrinks)
-             '()
-             (cons (shrink-tree-val (car shrinks))
-                   (loop (car shrinks)))))))))
-
-(define/contract (full-shrink g [size 30] #:first-n [first-n? #f] #:max-depth [max-depth? 1]
-                              [rng (current-pseudo-random-generator)])
-  (->* (gen?) (exact-positive-integer?
-               #:first-n (or/c false/c exact-positive-integer?)
-               #:max-depth (or/c false/c exact-nonnegative-integer?)
-               pseudo-random-generator?)
+(define/contract (shrink g
+                         size
+                         [rng (current-pseudo-random-generator)]
+                         #:limit [limit #f]
+                         #:max-depth [max-depth 1])
+  (->* (gen? exact-positive-integer?)
+       (pseudo-random-generator?
+        #:limit (or/c #f exact-positive-integer?)
+        #:max-depth (or/c #f exact-nonnegative-integer?))
        (listof any/c))
-  (let ([st (g rng size)])
-    (let loop ([st st]
-               [depth 0])
-      (cons (value st)
-            (if (and max-depth? (= max-depth? depth))
-                (if (not (stream-empty? (shrink st)))
-                    (list '...)
-                    '())
-                (let across ([shrinks (shrink st)]
-                             [n 0])
-                  (cond
-                    [(stream-empty? shrinks) '()]
-                    [(and first-n? (= first-n? n)) (list '...)]
-                    [else (cons (loop (stream-first shrinks) (add1 depth))
-                                (across (stream-rest shrinks) (add1 n)))])))))))
+  (let loop ([tree (g rng size)]
+             [depth 0])
+    (cons
+     (shrink-tree-val tree)
+     (cond
+       [(and max-depth (= max-depth depth))
+        (if (stream-empty? (shrink-tree-shrinks tree))
+            '()
+            '(...))]
+       [else
+        (let across ([shrinks (shrink-tree-shrinks tree)] [n 0])
+          (cond
+            [(stream-empty? shrinks) '()]
+            [(and limit (= limit n)) '(...)]
+            [else (cons (loop (stream-first shrinks) (add1 depth))
+                        (across (stream-rest shrinks) (add1 n)))]))]))))
 
 (define (gen:const v)
   (gen
@@ -157,37 +80,31 @@
   (-> gen? (-> any/c any/c) gen?)
   (gen
    (lambda (rng size)
-     (shrink-tree-map f (g rng size)))))
+     (shrink-tree-map (g rng size) f))))
 
-(define (random-prg-vector rng)
-  (vector
-   (random 4294967087)
-   (random 4294967087)
-   (random 4294967087)
-   (random 4294944443)
-   (random 4294944443)
-   (random 4294944443)))
+(define (make-rng-proc rng)
+  (define state
+    (vector
+     (random 4294967087 rng)
+     (random 4294967087 rng)
+     (random 4294967087 rng)
+     (random 4294944443 rng)
+     (random 4294944443 rng)
+     (random 4294944443 rng)))
+  (λ ()
+    (vector->pseudo-random-generator state)))
 
-(define/contract (gen:bind g h)
+(define/contract (gen:bind g proc)
   (-> gen? (-> any/c gen?) gen?)
   (gen
    (lambda (rng size)
-     (let ([g-st (g rng size)]
-           ;; ad-hoc split
-           [rng-state (random-prg-vector rng)])
-       (shrink-tree-join
-        (shrink-tree-map
-         (λ (val) ((h val) (vector->pseudo-random-generator rng-state) size))
-         g-st))))))
-
-(define (shrink-tree-filter p st)
-  (if (p (value st))
-      (shrink-tree
-       (value st)
-       (stream-filter identity
-                      (stream-map (curry shrink-tree-filter p)
-                                  (shrink st))))
-      #f))
+     (define g-tree (g rng size))
+     (define make-rng (make-rng-proc rng))
+     (shrink-tree-join
+      (shrink-tree-map
+       g-tree
+       (λ (val)
+         ((proc val) (make-rng) size)))))))
 
 (define/contract (gen:filter g p [max-attempts 1000])
   (->* (gen? (-> any/c boolean?))
@@ -197,14 +114,16 @@
    (lambda (rng size)
      (let search ([attempts 0]
                   [size size])
-       (let ([st? (shrink-tree-filter p (g rng size))])
-         (cond
-           [st? st?]
-           [(= attempts max-attempts)
-            (raise (exn:fail:gen:exhausted (format "exhausted after ~a attempts" attempts)
-                                           (current-continuation-marks)))]
-           [else
-            (search (add1 attempts) (add1 size))]))))))
+       (cond
+         [(shrink-tree-filter (g rng size) p)]
+
+         [(= attempts max-attempts)
+          (raise (exn:fail:gen:exhausted
+                  (format "exhausted after ~a attempts" attempts)
+                  (current-continuation-marks)))]
+
+         [else
+          (search (add1 attempts) (add1 size))])))))
 
 (define/contract (gen:choice . gs)
   (-> gen? gen? ... gen?)
@@ -234,43 +153,28 @@
   (-> gen? gen?)
   (gen
    (lambda (rng size)
-     (shrink-tree (value (g rng size)) empty-stream))))
+     (shrink-tree (shrink-tree-val (g rng size)) empty-stream))))
 
-(define/contract (gen:with-shrink g shr)
-  (-> gen? (-> any/c (stream/c any/c)) gen?)
+(define/contract (gen:with-shrink g proc)
+  (-> gen? (-> any/c stream?) gen?)
   (gen
    (lambda (rng size)
-     (build-shrink-tree (value (g rng size)) shr))))
+     (make-shrink-tree (shrink-tree-val (g rng size)) proc))))
 
 (module+ private
-  (provide gen shrink-tree))
+  (provide gen))
 
 (module+ test
   (require rackunit)
 
-  (check-equal? (sample (gen:const 1) 1)
-                '(1))
-
-  (check-equal? (sample (gen:const 1) 5)
-                '(1 1 1 1 1))
-
-  (check-equal? (sample (gen:map (gen:const 1) add1) 1)
-                '(2))
-
-  (check-equal? (sample (gen:bind (gen:const 1)
-                                  (lambda (v)
-                                    (gen:const (add1 v))))
-                        1)
-                '(2))
-
-  (check-equal? (sample (gen:filter (gen:const 1)
-                                    number?)
-                        1)
-                '(1))
+  (check-equal? (sample (gen:const 1) 1) '(1))
+  (check-equal? (sample (gen:const 1) 5) '(1 1 1 1 1))
+  (check-equal? (sample (gen:map (gen:const 1) add1) 1) '(2))
+  (check-equal? (sample (gen:bind (gen:const 1) (λ (v) (gen:const (add1 v)))) 1) '(2))
+  (check-equal? (sample (gen:filter (gen:const 1) number?) 1) '(1))
 
   (check-exn
    exn:fail:gen?
    (lambda ()
      (sample (gen:filter (gen:const 1)
-                         (lambda (v)
-                           (eqv? v 2)))))))
+                         (λ (v) (eqv? v 2)))))))

@@ -1,24 +1,15 @@
 #lang racket/base
 
 (require racket/contract
-         racket/function
          racket/list
-         racket/match
-         racket/promise
          racket/random
          racket/stream
          "core.rkt"
-         (submod "core.rkt" private))
+         (submod "core.rkt" private)
+         (submod "shrink-tree.rkt" private))
 
 (provide
  (all-from-out "core.rkt")
-
- halves
- shrink-integer
- shrink-one
- removes
- list-cuts
- shrink-list
 
  gen:natural
  gen:integer-in
@@ -31,9 +22,7 @@
  gen:char-digit
  gen:char-alphanumeric
  gen:tuple
- gen:tuple*
  gen:list
- gen:list-len
  gen:vector
  gen:bytes
  gen:string
@@ -43,31 +32,11 @@
  gen:hasheqv
  gen:frequency)
 
-(define/contract (halves n)
-  (-> exact-integer? (stream/c exact-integer?))
-  (if (zero? n)
-      empty-stream
-      (stream-cons n (halves (quotient n 2)))))
-
-(define/contract (shrink-integer n)
-  (-> exact-integer? (stream/c exact-integer?))
-  (if (zero? n)
-      empty-stream
-      (stream-append (if (negative? n)
-                         (stream (abs n)) empty-stream)
-                     (stream-map (curry - n) (halves n)))))
-
 (define gen:natural
   (gen
    (lambda (rng size)
-     (let ([n (random 0 (add1 size) rng)])
-       (build-shrink-tree n shrink-integer)))))
-
-(define gen:integer
-  (gen
-   (lambda (rng size)
-     (let ([n (random (- size) (add1 size) rng)])
-       (build-shrink-tree n shrink-integer)))))
+     (define n (random 0 (add1 size) rng))
+     (make-shrink-tree n shrink-integer))))
 
 (module+ test
   (require rackunit)
@@ -77,78 +46,102 @@
       (random-seed 1337)
       body ...))
 
-  (define-syntax-rule (check-values (v ...) body ...)
-    (call-with-values
-     (lambda ()
-       body ...)
-     (lambda vs
-       (check-equal? vs (list v ...)))))
+  (define-check (check-samples/num n g expected)
+    (check-equal? (sample g n) expected))
+  (define-check (check-samples g expected)
+    (check-samples/num 5 g expected))
+
+  (define-check (check-shrinks*/sized size g expected)
+    (check-equal? (shrink g size #:max-depth #f) expected))
+  (define-check (check-shrinks* g expected)
+    (check-shrinks*/sized 5 g expected))
+  (define-check (check-shrinks/sized size g expected)
+    (check-equal? (shrink g size) expected))
+  (define-check (check-shrinks g expected)
+    (check-shrinks/sized 5 g expected))
 
   (tc "naturals"
-    (check-equal? (sample gen:natural 5) '(0 0 4 5 8))
-    (check-equal? (sample gen:natural 5) '(0 1 3 6 4)))
+    (check-samples gen:natural '(0 0 4 5 8))
+    (check-samples gen:natural '(0 1 3 6 4)))
 
   (tc "shrinking naturals"
-    (check-equal? (full-shrink gen:natural)
-                  '(9 (0) (5 ...) (7 ...) (8 ...)))
-
-    (check-equal? (full-shrink gen:natural 500)
-                  '(89 (0) (45 ...) (67 ...) (78 ...) (84 ...) (87 ...) (88 ...)))
-
-    (check-equal? (full-shrink gen:natural 300)
-                  '(281 (0) (141 ...) (211 ...) (246 ...) (264 ...) (273 ...)
-                        (277 ...) (279 ...) (280 ...)))))
+    (check-shrinks           gen:natural '(1 (0)))
+    (check-shrinks/sized  30 gen:natural '(5 (0) (3 ...) (4 ...)))
+    (check-shrinks/sized 500 gen:natural '(468 (0) (234 ...) (351 ...) (410 ...) (439 ...) (454 ...) (461 ...) (465 ...) (467 ...)))
+    (check-shrinks/sized 500 gen:natural '(297 (0) (149 ...) (223 ...) (260 ...) (279 ...) (288 ...) (293 ...) (295 ...) (296 ...)))))
 
 (define/contract (gen:integer-in lo hi)
   (->i ([lo exact-integer?]
         [hi (lo) (>=/c lo)])
        [result gen?])
-  (gen:map (gen:resize gen:natural (- hi lo))
-           (curry + lo)))
+  (gen:map
+   (gen:resize gen:natural (- hi lo))
+   (λ (nat) (+ lo nat))))
 
 (module+ test
   (tc "integer-in"
-    (check-equal? (sample (gen:integer-in 0 20) 5) '(6 3 19 12 10))
-    (check-equal? (sample (gen:integer-in -5 5) 5) '(3 1 3 2 -3)))
+    (check-samples (gen:integer-in 0 20) '(6 3 19 12 10))
+    (check-samples (gen:integer-in -5 5) '(3 1 3 2 -3)))
 
   (tc "shrinking integer-in"
-      
-    (check-equal? (full-shrink (gen:integer-in 0 20))
-                    '(6 (0) (3 ...) (5 ...)))
-
-    (check-equal? (full-shrink (gen:integer-in -200 20))
-                  '(-161 (-200) (-180 ...) (-170 ...) (-165 ...)
-                         (-163 ...) (-162 ...)))))
+    (check-shrinks          (gen:integer-in 0 20)    '(6 (0) (3 ...) (5 ...)))
+    (check-shrinks/sized 30 (gen:integer-in -200 20) '(-161 (-200) (-180 ...) (-170 ...) (-165 ...) (-163 ...) (-162 ...)))))
 
 (define gen:real
   (gen
    (lambda (rng _size)
-     (shrink-tree (random rng) empty-stream))))
+     (make-shrink-tree (random rng)))))
 
-(define/contract (gen:one-of xs)
-  (-> (non-empty-listof any/c) gen?)
+(module+ test
+  (tc "real"
+    (check-samples gen:real '(0.2904158091187683 0.17902984405826025 0.9348212358175817 0.592848361775386 0.4846099332903666)))
+
+  (tc "shrinking real"
+    (check-shrinks gen:real '(0.2904158091187683))))
+
+(define/contract (gen:one-of choices [equal?-proc equal?])
+  (->* ((non-empty-listof any/c))
+       ((-> any/c any/c boolean?))
+       gen?)
   (gen
    (lambda (rng _size)
-     (shrink-tree (random-ref xs rng) empty-stream))))
+     (shrink-tree-map
+      (make-shrink-tree
+       (cons (random-ref choices rng) choices)
+       (λ (choice&choices)
+         (define prev-choice (car choice&choices))
+         (define prev-choices (cdr choice&choices))
+         (define remaining-choices (remove prev-choice prev-choices equal?-proc))
+         (if (null? remaining-choices)
+             (stream)
+             (stream (cons (random-ref remaining-choices rng) remaining-choices)))))
+      (λ (choice&choices)
+        (car choice&choices))))))
+
+(module+ test
+  (tc "one-of"
+    (check-samples (gen:one-of '(1 2 3)) '(3 1 2 1 3)))
+
+  (tc "shrinking one-of"
+    (check-shrinks  (gen:one-of '(1))     '(1))
+    (check-shrinks  (gen:one-of '(1 2 3)) '(3 (1 ...)))
+    (check-shrinks* (gen:one-of '(1 2 3)) '(1 (2 (3))))))
 
 (define gen:boolean
   (gen
    (lambda (rng _size)
-     (case (random 0 2 rng)
-       [(0) (shrink-tree #f empty-stream)]
-       [(1) (shrink-tree #t (stream (shrink-tree #f empty-stream)))]))))
+     (if (zero? (random 0 2 rng))
+         (make-shrink-tree #f)
+         (make-shrink-tree #t (λ (true?) (if true? (stream #f) empty-stream)))))))
 
 (module+ test
   (tc "boolean"
-    (check-equal? (sample gen:boolean 5)
-                  '(#f #f #t #t #f)))
+    (check-samples gen:boolean '(#f #f #t #t #f)))
 
   (tc "shrinking boolean"
-      (check-equal? (full-shrink gen:boolean) '(#f))
-      
-      (check-equal? (full-shrink gen:boolean) '(#f))
-      
-      (check-equal? (full-shrink gen:boolean) '(#t (#f)))))
+    (check-shrinks gen:boolean '(#f))
+    (check-shrinks gen:boolean '(#f))
+    (check-shrinks gen:boolean '(#t (#f)))))
 
 (define char-integer/c
   (or/c (integer-in 0      #xD7FF)
@@ -190,121 +183,68 @@
   (-> gen? ... gen?)
   (gen
    (lambda (rng size)
-     (let ([xs (map (lambda (g) (g rng size)) gs)])
-       (shrink-tree-map
-        (curry map value)
-        (build-shrink-tree xs (curry shrink-one shrink)))))))
-
-(define/contract (gen:tuple* gs)
-  (-> (listof gen?) gen?)
-  (apply gen:tuple gs))
+     (define trees
+       (for/list ([g (in-list gs)])
+         (g rng size)))
+     (shrink-tree-map
+      (make-shrink-tree trees shrink-trees)
+      (λ (ts) (map shrink-tree-val ts))))))
 
 (module+ test
   (tc "tuple"
-    (check-equal? (sample (gen:tuple gen:natural gen:char-digit) 4)
-                  '((0 #\1) (1 #\5) (2 #\7) (6 #\7))))
+    (check-samples
+     (gen:tuple gen:natural gen:char-digit)
+     '((0 #\1) (1 #\5) (2 #\7) (6 #\7) (11 #\2))))
 
   (tc "shrinking tuple"
-      (check-equal? (full-shrink (gen:tuple gen:natural (gen:symbol gen:char-digit))
-                                 20 #:first-n 6)
-                    '((6 |954|)
-                      ((0 |954|) ...)
-                      ((3 |954|) ...)
-                      ((5 |954|) ...)
-                      ((6 ||) ...)
-                      ((6 |54|) ...)
-                      ((6 |94|) ...)
-                      ...))))
-
-(define/contract (shrink-one shr xs)
-  (-> (-> any/c (stream/c any/c)) (listof any/c)
-      (stream/c (listof any/c)))
-  (match xs
-    ['() empty-stream]
-    [(cons x xs)
-     (stream-append
-      (for/stream ([shrunk-x (shr x)])
-        (cons shrunk-x xs))
-      (for/stream ([shrunk-xs (shrink-one shr xs)])
-        (cons x shrunk-xs)))]))
-
-(define/contract (removes k n xs)
-  (-> exact-nonnegative-integer? exact-nonnegative-integer? (listof any/c)
-      (stream/c (listof any/c)))
-  (cond
-    [(> k n) empty-stream]
-    [(= k n) (stream '())]
-    [else (let-values ([(xs-l xs-r) (split-at xs k)])
-            (stream-cons xs-r (for/stream ([r-xs (removes k (- n k) xs-r)])
-                                (append xs-l r-xs))))]))
-
-(define (stream-flatten stream-streams)
-  (if (stream-empty? stream-streams)
-      empty-stream
-      (stream-append
-       (stream-first stream-streams)
-       (stream-flatten (stream-rest stream-streams)))))
-
-(define/contract (list-cuts l)
-  (-> (listof any/c) (stream/c (listof any/c)))
-  (let ([n (length l)])
-    (stream-flatten
-     (for/stream ([k (halves n)])
-       (removes k n l)))))
-
-(define/contract (shrink-list shr xs)
-  (-> (-> any/c (stream/c any/c)) (stream/c any/c)
-      (stream/c (listof any/c)))
-  (if (= (length xs) 0)
-      empty-stream
-      (stream-append
-       (list-cuts xs)
-       (shrink-one shr xs))))
+    (check-shrinks
+     (gen:tuple gen:natural (gen:symbol gen:char-digit))
+     '((1 |9|)
+       ((0 |9|) ...)
+       ((1 ||)  ...)
+       ((1 |0|) ...)
+       ((1 |5|) ...)
+       ((1 |7|) ...)
+       ((1 |8|) ...)))))
 
 (define/contract (gen:list g #:max-length [max-len 128])
   (->* (gen?) (#:max-length exact-nonnegative-integer?) gen?)
   (gen
    (lambda (rng size)
-     (let* ([len (min (random 0 (add1 size) rng) max-len)]
-            [xs (for/list ([_ (in-range len)])
-                  (g rng size))])
-       (shrink-tree-map
-        (curry map value)
-        (build-shrink-tree xs (curry shrink-list shrink)))))))
-
-(define/contract (gen:list-len g len)
-  (-> gen? exact-nonnegative-integer? gen?)
-  (gen
-   (lambda (rng size)
-     (let ([xs (for/list ([_ (in-range len)])
-                 (g rng size))])
-       (shrink-tree-map
-        (curry map value)
-        (build-shrink-tree xs (curry shrink-one shrink)))))))
+     (define len (min (random 0 (add1 size) rng) max-len))
+     (define trees
+       (for/list ([_ (in-range len)])
+         (g rng size)))
+     (shrink-tree-map
+      (make-shrink-tree trees shrink-list)
+      (λ (ts) (map shrink-tree-val ts))))))
 
 (module+ test
   (tc "list"
-    (check-equal? (sample (gen:list gen:natural) 4)
-                  '(()
-                    ()
-                    (2 2 3 3)
-                    (6 2 6 5 2 2 9))))
+    (check-samples
+     (gen:list gen:natural)
+     '(()
+       ()
+       (2 2 3 3)
+       (6 2 6 5 2 2 9)
+       (2 13))))
 
   (tc "shrinking list"
-      (check-equal? (full-shrink (gen:list gen:natural) 20 #:first-n 11)
-                    '((3 19 12 10 16 12)
-                      (())
-                      ((10 16 12) ...)
-                      ((3 19 12) ...)
-                      ((19 12 10 16 12) ...)
-                      ((3 12 10 16 12) ...)
-                      ((3 19 10 16 12) ...)
-                      ((3 19 12 16 12) ...)
-                      ((3 19 12 10 12) ...)
-                      ((3 19 12 10 16) ...)
-                      ((0 19 12 10 16 12) ...)
-                      ((2 19 12 10 16 12) ...)
-                      ...))))
+    (check-equal?
+     (shrink (gen:list gen:natural) 20 #:limit 11)
+     '((3 19 12 10 16 12)
+       (())
+       ((10 16 12) ...)
+       ((3 19 12) ...)
+       ((19 12 10 16 12) ...)
+       ((3 12 10 16 12) ...)
+       ((3 19 10 16 12) ...)
+       ((3 19 12 16 12) ...)
+       ((3 19 12 10 12) ...)
+       ((3 19 12 10 16) ...)
+       ((0 19 12 10 16 12) ...)
+       ((2 19 12 10 16 12) ...)
+       ...))))
 
 (define gen:vector
   (make-keyword-procedure
@@ -335,16 +275,17 @@
     (unless (even? (length pairs))
       (raise-argument-error who "an even number of arguments" pairs))
 
-    (let-values ([(keys gens)
-                  (for/fold ([keys '()]
-                             [gens '()])
-                            ([(v i) (in-indexed pairs)])
-                    (if (even? i)
-                        (values (cons v keys) gens)
-                        (values keys (cons v gens))))])
-      (gen:map (apply gen:tuple gens)
-               (lambda (tuple)
-                 (constructor (map cons keys tuple)))))))
+    (define-values (keys gens)
+      (for/fold ([keys '()]
+                 [gens '()])
+                ([(v i) (in-indexed pairs)])
+        (if (even? i)
+            (values (cons v keys) gens)
+            (values keys (cons v gens)))))
+
+    (gen:map (apply gen:tuple gens)
+             (lambda (tuple)
+               (constructor (map cons keys tuple))))))
 
 (define-syntax-rule (define-gen:hash id f)
   (define id (make-gen:hash 'id f)))
@@ -357,31 +298,71 @@
   (->i ([freqs (non-empty-listof (cons/c exact-nonnegative-integer? gen?))])
        #:pre (freqs) (ormap (λ (f) (> (car f) 0)) freqs)
        [result gen?])
-  (define total (apply + (map car freqs)))
-  (let ([total (apply + (map car freqs))])
-    (gen:bind
-     (gen:no-shrink
-      (gen:integer-in 0 (sub1 total)))
-     (lambda (n)
-       (let loop ([sum 0]
-                  [freqs freqs])
-         (let* ([pair (car freqs)]
-                [sum* (+ (car pair) sum)])
-           (if (> sum* n)
-               (cdr pair)
-               (loop sum* (cdr freqs)))))))))
+  (define total
+    (apply + (map car freqs)))
+  (gen:bind
+   (gen:no-shrink
+    (gen:integer-in 0 (sub1 total)))
+   (lambda (n)
+     (let loop ([sum 0]
+                [freqs freqs])
+       (define pair (car freqs))
+       (define next-sum (+ (car pair) sum))
+       (if (> next-sum n)
+           (cdr pair)
+           (loop next-sum (cdr freqs)))))))
 
 (module+ test
   (tc "frequency"
-    (check-equal?
-     (sample (gen:frequency `((7 . ,gen:natural)
-                              (5 . ,gen:char-letter)
-                              (0 . ,(gen:const 'not-this-one))
-                              (2 . ,(gen:string gen:char-letter #:max-length 8))))
-             10)
-     '(0 #\j "MK" "VccD" 7 18 #\G "FXYcZQxB" 19 #\u))))
+    (check-samples/num 10
+      (gen:frequency
+       `((7 . ,gen:natural)
+         (5 . ,gen:char-letter)
+         (0 . ,(gen:const 'not-this-one))
+         (2 . ,(gen:string gen:char-letter #:max-length 8))))
+      '(0 #\j "MK" "VccD" 7 18 #\G "FXYcZQxB" 19 #\u))))
+
+
+;; shrinking helpers ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+(define (halves n)
+  (if (zero? n)
+      empty-stream
+      (stream-cons n (halves (quotient n 2)))))
+
+(define (shrink-integer n)
+  (if (zero? n)
+      empty-stream
+      (stream-append
+       (if (negative? n)
+           (stream (abs n))
+           empty-stream)
+       (for/stream ([v (in-stream (halves n))])
+         (- n v)))))
+
+(define (shrink-list trees)
+  (define (removes k n xs)
+    (cond
+      [(> k n) empty-stream]
+      [(= k n) (stream null)]
+      [else
+       (define-values (xs-l xs-r)
+         (split-at xs k))
+       (stream-cons
+        xs-r
+        (for/stream ([r-xs (in-stream (removes k (- n k) xs-r))])
+          (append xs-l r-xs)))]))
+  (define len
+    (length trees))
+  (if (zero? len)
+      empty-stream
+      (stream-append
+       (for*/stream ([k (in-stream (halves len))]
+                     [l (in-stream (removes k len trees))])
+         l)
+       (shrink-trees trees))))
 
 ;; Local Variables:
-;; eval: (put 'check-values 'racket-indent-function #'defun)
+;; eval: (put 'check-samples/num 'racket-indent-function #'defun)
 ;; eval: (put 'tc 'racket-indent-function #'defun)
 ;; End:
